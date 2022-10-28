@@ -54,6 +54,17 @@ class Frontier(object):
             return None
 
     def add_url(self, url):
+        """
+        If url not in shelve, save url to shelve as incomplete, and add url to "To Be Downloaded" queue.
+        If url is already in shelve, do nothing.
+        Parameters
+        ----------
+        url: str
+
+        Returns
+        -------
+        None
+        """
         url = normalize(url)
         urlhash = get_urlhash(url)
         if urlhash not in self.save:
