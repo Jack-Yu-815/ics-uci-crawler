@@ -1,8 +1,10 @@
 import re
-from urllib.parse import urlparse
+from urllib.parse import urlparse, urljoin
 from bs4 import BeautifulSoup
 import lxml.html as lh
 import copy
+from crawler.worker import Worker
+from hashlib import blake2b
 
 # How many unique pages did you find? Uniqueness for the purposes of this assignment is ONLY established by the URL,
 # but discarding the fragment part. So, for example, http://www.ics.uci.edu#aaa and http://www.ics.uci.edu#bbb are
@@ -22,16 +24,16 @@ import copy
 
 domains = {"ics.uci.edu", "cs.uci.edu", "informatics.uci.edu", "stat.uci.edu", "today.uci.edu"}
 
-word_freq = dict()
-max_word_url = (None, 0)
-crawled_urls = set()
+# worker.word_freq = dict()
+# max_word_url = (None, 0)
+# crawled_urls = set()
 
-def scraper(url, resp):
-    links = extract_next_links(url, resp)
+def scraper(worker, url, resp):
+    links = extract_next_links(worker, url, resp, min_token=150)
     return [link for link in links if is_valid(link)]
 
 
-def extract_next_links(url, resp):
+def extract_next_links(worker: Worker, url, resp, min_token):
     """
 
     Parameters
@@ -53,42 +55,82 @@ def extract_next_links(url, resp):
     #         resp.raw_response.url: the url, again
     #         resp.raw_response.content: the content of the page!
     # Return a list with the hyperlinks (as strings) scrapped from resp.raw_response.content
-    global word_freq, max_word_url, crawled_urls
+
+    # global word_freq, max_word_url, crawled_urls
 
     urls = []
     try:
         if resp.status == 200:
-            charset = resp.raw_response.encoding  # response content encoding
-            string = resp.raw_response.content.decode(charset)
+            if 'Content-Type' not in resp.raw_response.headers or any(format in resp.raw_response.headers['Content-Type'].lower() for format in ["text/html", "text/plain"]):
+                if 'Content-Type' in resp.raw_response.headers:
+                    charset = resp.raw_response.encoding  # response content encoding
+                else:
+                    charset = resp.raw_response.apparent_encoding
 
-            soup = BeautifulSoup(string, "html.parser")
-            # print(len(set(soup.find_all("a", href=True))))
-            is_html = bool(soup.find())
-            if is_html:
-                # extract urls from the response page
-                doc: lh.HtmlElement = lh.fromstring(string, resp.url)
-                doc.make_links_absolute()
-                for _, _, link, _ in doc.iterlinks():
-                    # print(is_valid(link), link, urlparse(link).netloc)
-                    urls.append(urlparse(link)._replace(fragment="").geturl())
+                # in case the response header returns the wrong charset encoding
+                try:
+                    text = resp.raw_response.content.decode(charset)
+                except UnicodeDecodeError:
+                    text = resp.raw_response.content.decode(resp.raw_response.apparent_encoding)
 
-                assert resp.url not in crawled_urls, f"{resp.url} is already visited"
-                crawled_urls.add(resp.url)
+                # if content type is HTML
+                if 'Content-Type' not in resp.raw_response.headers or "text/html" in resp.raw_response.headers['Content-Type'].lower():
+                    soup = BeautifulSoup(text, "html.parser")
+                    # extract urls from the response page
+                    doc: lh.HtmlElement = lh.fromstring(resp.raw_response.content, resp.url)
+                    doc.make_links_absolute()
+                    
+                    for _, _, link, _ in doc.iterlinks():
+                        # print(is_valid(link), link, urlparse(link).netloc)
+                        urls.append(urlparse(link)._replace(fragment="").geturl())
+                    
+                    assert resp.url not in worker.crawled_urls, f"{resp.url} is already visited"
+                    worker.crawled_urls.add(resp.url)
 
-                # token statistics
-                text = soup.get_text()
+                    # token statistics
+                    text = soup.get_text()
+
+                # if content type is plain text
+                elif 'Content-Type' not in resp.raw_response.headers or "text/plain" in resp.raw_response.headers['Content-Type'].lower():
+                    text = resp.raw_response.content.decode(charset)
+                    urls.extend(txt_to_urls(text, fragments=False))
+
+                # if any of the accepted format, compute token statistics
                 words = tokenize(text)
-                freq = compute_word_frequencies(words)
+                word_freq = compute_word_frequencies(words)
+                # print(word_freq)
                 word_num = len(words)
-                if word_num > max_word_url[1]:
-                    max_word_url = (resp.url, word_num)
-                word_freq = add_word_freqs(word_freq, freq)
-                print(max_word_url)
+                print(f"has {word_num} words. Max so far: {worker.max_word_url[1]}")
+
+
+                if worker.simhash is not None:
+                    max_url, max_sim = worker.simhash.max_similarity(word_freq)
+                    print(max_sim, max_url, "\n")
+
+                # don't crawl low info page
+                if word_num < min_token:
+                    return []
+                # don't crawl near duplicate page
+                elif worker.simhash is not None:
+                    if worker.simhash.is_near_duplicate(word_freq, threshold=0.99):
+                        return []
+                    else:
+                        worker.simhash.store_simhash(resp.url, word_freq)
+
+                # keep track of url with the most words
+                if word_num > worker.max_word_url[1]:
+                    worker.max_word_url = (resp.url, word_num)
+                worker.word_freq = add_word_freqs(worker.word_freq, word_freq)
 
         else:
             print(f"error {resp.status}: {resp.error}, {resp.url}")
+    
+    except UnicodeDecodeError:
+        print("UnicodeDecodeError:")
+        print(f"error {resp.status}: {resp.error}, {resp.url}, {resp.raw_response.apparent_encoding}, {resp.raw_response.encoding}, {resp.raw_response.headers}")
     except:
-        print(f"error {resp.status}: {resp.error}, {resp.url}, {resp.raw_response.apparent_encoding}, {resp.raw_response.__dict__}")
+        if resp.raw_response:
+            print(f"error {resp.status}: {resp.error}, {resp.url}, {resp.raw_response.apparent_encoding}, {resp.raw_response.encoding}, {resp.raw_response.headers}")
         raise
     # assert False
     return urls
@@ -104,6 +146,8 @@ def is_valid(url):
             return False
         elif all(re.match(".*" + d + "$", parsed.hostname) is None for d in domains):
             return False
+        elif "swiki.ics.uci.edu" == parsed.hostname:
+            return False
         # check if url belongs to today.uci.edu/department/information_computer_sciences/
         elif re.match(".*" + "today.uci.edu" + "$", parsed.hostname) is not None:
             if "department/information_computer_sciences" not in parsed.path:
@@ -117,11 +161,13 @@ def is_valid(url):
             + r"|data|dat|exe|bz2|tar|msi|bin|7z|psd|dmg|iso"
             + r"|epub|dll|cnf|tgz|sha1"
             + r"|thmx|mso|arff|rtf|jar|csv"
-            + r"|rm|smil|wmv|swf|wma|zip|rar|gz)$", parsed.path.lower())
+            + r"|rm|smil|wmv|swf|wma|zip|rar|gz"
+            + r"|r|bib)$", parsed.path.lower())
 
     except TypeError:
-        print("TypeError for ", parsed)
-        raise
+        print("TypeError for ", parsed, url)
+        if parsed.netloc != "":
+            raise
 
 
 # linear time complexity (maybe slower than linear, but faster than n squared).
@@ -169,6 +215,31 @@ def print_freq(frequencies):
         print(f"{token} -> {count}")
 
 
+def txt_to_urls(text, fragments=False):
+    # scheme (optional)
+    # (?:(?P<scheme>http|https)://)?
+    # 
+    # hostname (required)
+    # (?P<hostname>(?:[\w-]+\.)+[a-z]{2,3})
+    # 
+    # path (optional)
+    # (?P<path>(?:/[\w-]+)+(?:\.[a-z]+)?)?
+    # (?P<path>(?:/[\w-]+)+)?
+    # 
+    # query (optional)
+    # (?P<query>\?(?:[\w-]+=[\w-]+(?:&[\w-]+=[\w-]+)*))?
+    # 
+    # fragment (optional)
+    # (?P<fragment>#[\w-]+)?
+    ans = []
+    abs_url_pattern = re.compile(r"((?:(?P<scheme>http|https)://)?(?P<hostname>(?:[\w-]+\.)+[a-z]{2,3})(?P<path>(?:/[\w-]+)+(?:\.[a-z]+)?)?(?P<query>\?(?:[\w-]+=[\w-]+(?:&[\w-]+=[\w-]+)*))?(?P<fragment>#[\w-]+)?)")
+    for text_tuple in abs_url_pattern.findall(text):
+        url = text_tuple[0]
+        if not fragments:
+            url = urlparse(url)._replace(fragment="").geturl()
+        ans.append(url)
+
+    return ans
+
 if __name__ == "__main__":
-    soup = BeautifulSoup("?ahuihuia>", "html.parser")
-    print(soup)
+    pass
