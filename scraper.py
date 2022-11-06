@@ -2,9 +2,9 @@ import re
 from urllib.parse import urlparse, urljoin
 from bs4 import BeautifulSoup
 import lxml.html as lh
-import copy
-from crawler.worker import Worker
 from hashlib import blake2b
+import pickle
+from crawler.worker import Worker
 
 # How many unique pages did you find? Uniqueness for the purposes of this assignment is ONLY established by the URL,
 # but discarding the fragment part. So, for example, http://www.ics.uci.edu#aaa and http://www.ics.uci.edu#bbb are
@@ -22,14 +22,14 @@ from hashlib import blake2b
 # subdomain, number, for example: vision.ics.uci.edu, 10 (not the actual number here)
 
 
-domains = {"ics.uci.edu", "cs.uci.edu", "informatics.uci.edu", "stat.uci.edu", "today.uci.edu"}
+domains = {".ics.uci.edu", ".cs.uci.edu", ".informatics.uci.edu", ".stat.uci.edu"}
 
 # worker.word_freq = dict()
 # max_word_url = (None, 0)
 # crawled_urls = set()
 
 def scraper(worker, url, resp):
-    links = extract_next_links(worker, url, resp, min_token=150)
+    links = extract_next_links(worker, url, resp, min_token=130)
     return [link for link in links if is_valid(link)]
 
 
@@ -56,8 +56,6 @@ def extract_next_links(worker: Worker, url, resp, min_token):
     #         resp.raw_response.content: the content of the page!
     # Return a list with the hyperlinks (as strings) scrapped from resp.raw_response.content
 
-    # global word_freq, max_word_url, crawled_urls
-
     urls = []
     try:
         if resp.status == 200:
@@ -66,12 +64,18 @@ def extract_next_links(worker: Worker, url, resp, min_token):
                     charset = resp.raw_response.encoding  # response content encoding
                 else:
                     charset = resp.raw_response.apparent_encoding
+                
+                if charset is None:
+                    charset = 'utf-8'
 
                 # in case the response header returns the wrong charset encoding
                 try:
                     text = resp.raw_response.content.decode(charset)
                 except UnicodeDecodeError:
-                    text = resp.raw_response.content.decode(resp.raw_response.apparent_encoding)
+                    if resp.raw_response.apparent_encoding is not None:
+                        text = resp.raw_response.content.decode(resp.raw_response.apparent_encoding)
+                    else:
+                        raise
 
                 # if content type is HTML
                 if 'Content-Type' not in resp.raw_response.headers or "text/html" in resp.raw_response.headers['Content-Type'].lower():
@@ -81,46 +85,40 @@ def extract_next_links(worker: Worker, url, resp, min_token):
                     doc.make_links_absolute()
                     
                     for _, _, link, _ in doc.iterlinks():
-                        # print(is_valid(link), link, urlparse(link).netloc)
                         urls.append(urlparse(link)._replace(fragment="").geturl())
-                    
-                    assert resp.url not in worker.crawled_urls, f"{resp.url} is already visited"
-                    worker.crawled_urls.add(resp.url)
 
                     # token statistics
                     text = soup.get_text()
 
                 # if content type is plain text
-                elif 'Content-Type' not in resp.raw_response.headers or "text/plain" in resp.raw_response.headers['Content-Type'].lower():
+                elif "text/plain" in resp.raw_response.headers['Content-Type'].lower():
                     text = resp.raw_response.content.decode(charset)
                     urls.extend(txt_to_urls(text, fragments=False))
+                
+                # otherwise, don't crawl
+                else:
+                    return []
 
                 # if any of the accepted format, compute token statistics
-                words = tokenize(text)
-                word_freq = compute_word_frequencies(words)
-                # print(word_freq)
-                word_num = len(words)
-                print(f"has {word_num} words. Max so far: {worker.max_word_url[1]}")
-
+                tokens = tokenize(text)
+                word_freq = compute_word_frequencies(tokens)
+                token_num = len(tokens)
 
                 if worker.simhash is not None:
                     max_url, max_sim = worker.simhash.max_similarity(word_freq)
-                    print(max_sim, max_url, "\n")
+                    print(max_sim, max_url)
 
                 # don't crawl low info page
-                if word_num < min_token:
+                if token_num < min_token:
                     return []
                 # don't crawl near duplicate page
                 elif worker.simhash is not None:
-                    if worker.simhash.is_near_duplicate(word_freq, threshold=0.99):
+                    if worker.simhash.is_near_duplicate(word_freq, threshold=0.995):
                         return []
                     else:
                         worker.simhash.store_simhash(resp.url, word_freq)
-
-                # keep track of url with the most words
-                if word_num > worker.max_word_url[1]:
-                    worker.max_word_url = (resp.url, word_num)
-                worker.word_freq = add_word_freqs(worker.word_freq, word_freq)
+                
+                worker.update_stats(resp.url, word_freq, token_num)
 
         else:
             print(f"error {resp.status}: {resp.error}, {resp.url}")
@@ -132,7 +130,7 @@ def extract_next_links(worker: Worker, url, resp, min_token):
         if resp.raw_response:
             print(f"error {resp.status}: {resp.error}, {resp.url}, {resp.raw_response.apparent_encoding}, {resp.raw_response.encoding}, {resp.raw_response.headers}")
         raise
-    # assert False
+    
     return urls
 
 
@@ -146,7 +144,16 @@ def is_valid(url):
             return False
         elif all(re.match(".*" + d + "$", parsed.hostname) is None for d in domains):
             return False
-        elif "swiki.ics.uci.edu" == parsed.hostname:
+
+        elif all(d not in parsed.hostname for d in domains):
+            return False
+        elif "swiki.ics.uci.edu" in parsed.hostname:  # a trap
+            return False
+        elif "archive.ics.uci.edu" in parsed.hostname and "ml/datasets.php" in parsed.path:  # a trap
+            return False
+        elif "wics.ics.uci.edu" in parsed.hostname and "events" in parsed.path:  # a trap
+            return False
+        elif "cbcl.ics.uci.edu" in parsed.hostname and "do=diff" in parsed.query:  # a trap
             return False
         # check if url belongs to today.uci.edu/department/information_computer_sciences/
         elif re.match(".*" + "today.uci.edu" + "$", parsed.hostname) is not None:
@@ -155,17 +162,19 @@ def is_valid(url):
 
         return not re.match(
             r".*\.(css|js|bmp|gif|jpe?g|ico"
-            + r"|png|tiff?|mid|mp2|mp3|mp4"
+            + r"|png|tiff?|mid|mp2|mp3|mp4|webm"
             + r"|wav|avi|mov|mpeg|ram|m4v|mkv|ogg|ogv|pdf"
             + r"|ps|eps|tex|ppt|pptx|doc|docx|xls|xlsx|names"
             + r"|data|dat|exe|bz2|tar|msi|bin|7z|psd|dmg|iso"
             + r"|epub|dll|cnf|tgz|sha1"
             + r"|thmx|mso|arff|rtf|jar|csv"
             + r"|rm|smil|wmv|swf|wma|zip|rar|gz"
-            + r"|r|bib)$", parsed.path.lower())
+            + r"|r|bib|py|git|pdf)$", parsed.path.lower())
 
     except TypeError:
         print("TypeError for ", parsed, url)
+
+        # there may be bad syntax urls. A url can be visited if hostname
         if parsed.netloc != "":
             raise
 
@@ -242,4 +251,6 @@ def txt_to_urls(text, fragments=False):
     return ans
 
 if __name__ == "__main__":
-    pass
+    invalid_urls = ["http://motifmap.ics.uci.edu/videos/SNPer.webm", "http://www.cecs.uci.edu", "http://www.ics.uci.edu/~xhx/publications/nc_vel_tuning.pdf", "https://wics.ics.uci.edu/events/2022-01-20/?ical=1"]
+    for url in invalid_urls:
+        print(is_valid(url))

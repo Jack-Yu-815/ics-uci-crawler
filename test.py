@@ -20,42 +20,11 @@ for url in urls:
     for link in txt_to_urls(url, fragments=False):
         print(link)
 
-# print([(a, l) for _, a, l, _ in lh.iterlinks(doc)])
+import pickle
 
-import numpy as np
-from crawler import SimHash
-from configparser import ConfigParser
-from argparse import ArgumentParser
-from utils.config import Config
-
-parser = ArgumentParser()
-parser.add_argument("--restart", action="store_true", default=False)
-parser.add_argument("--config_file", type=str, default="config-simhash.ini")
-args = parser.parse_args()
-
-cparser = ConfigParser()
-cparser.read(args.config_file)
-config = Config(cparser)
-
-hasher = SimHash(config, args.restart)
-V = hasher._compute_simhash({"worker": 1, "work":1, "works": 3})
-hasher.store_simhash("www.test_url.com", {"worker": 1, "work":1, "works": 3})
-from utils import get_urlhash
-print((hasher.save[get_urlhash("www.test_url.com")] == V).mean())
-print(V)
-
-
-s1 = "this is string one which doesn't have much meaning at all"
-s2 = "this is anothing string that differs from the first one and should have low similarity score"
-s3 = "this are strings, the ones which doesn't have much meaning at all"
-wf1 = compute_word_frequencies(tokenize(s1))
-wf2 = compute_word_frequencies(tokenize(s2))
-wf3 = compute_word_frequencies(tokenize(s3))
-
-
-hasher.store_simhash("www.test_url1.com", wf1)
-# assert (hasher._compute_simhash(wf1) == hasher._compute_simhash(wf3)).mean() == 1
-# assert (hasher.save[get_urlhash("www.test_url.com")] == hasher._compute_simhash(wf1)).mean() == 1, (hasher.save[get_urlhash("www.test_url.com")] == hasher._compute_simhash(wf1)).mean()
-
-
-print(hasher.max_similarity(wf3))
+with open("stats_0.pickle", 'rb') as file:
+    crawled_urls, (max_url, max_word_num), total_word_freq, ics_subdomains = pickle.load(file)
+print(len(crawled_urls), "urls crawled")
+print("subdomains:")
+for d in sorted(ics_subdomains):
+    print(d, "->", sum(1 for page in crawled_urls if d in urlparse(page).hostname))

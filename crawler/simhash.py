@@ -48,7 +48,7 @@ class SimHash:
     def is_near_duplicate(self, word_freq, threshold=0.9):
         V = self._compute_simhash(word_freq)
         for vector in self.save.values():
-            if (vector == V).mean() > threshold:
+            if (vector == V).mean() >= threshold:
                 return True
         return False
 
